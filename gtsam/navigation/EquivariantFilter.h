@@ -30,7 +30,7 @@ namespace gtsam {
 /**
  * Equivariant Filter (EqF) for state estimation on Lie groups.
  *
- * The EqF estimates a Lie group state X ∈ G and a manifold state ξ ∈ M.
+ * The EqF estimates a Lie group state X in G and a manifold state xi in M.
  * It uses a symmetry principle where the error dynamics are autonomous in a
  * specific frame.
  *
@@ -58,17 +58,29 @@ class EquivariantFilter : public ManifoldEKF<M> {
   static constexpr int DimG = traits<G>::dimension;
   using TangentG = typename traits<G>::TangentVector;
 
-  // Cross-dimension helpers
-  using MatrixMG = Eigen::Matrix<double, DimM, DimG>;
-  using MatrixGM = Eigen::Matrix<double, DimG, DimM>;
+  // Cross-dimension helpers: use dynamic matrices when either dimension is
+  // dynamic
+  static constexpr bool IsDynamic =
+      (DimM == Eigen::Dynamic) || (DimG == Eigen::Dynamic);
+  using MatrixMG =
+      std::conditional_t<IsDynamic, Eigen::MatrixXd,
+                         Eigen::Matrix<double, DimM, DimG>>;
+  using MatrixGM =
+      std::conditional_t<IsDynamic, Eigen::MatrixXd,
+                         Eigen::Matrix<double, DimG, DimM>>;
 
- private:
+ protected:
   M xi_ref_;  // Origin (reference) state on the manifold
-  typename Symmetry::Orbit act_on_ref_;  // Orbit of the reference state
+  G g_;       // Group element estimate
+
   MatrixMG Dphi0_;           // Differential of state action at identity
   MatrixGM InnovationLift_;  // Innovation lift matrix ((Dphi0)^+)
 
-  G g_;  // Group element estimate
+  // Helper to detect whether Symmetry provides an Orbit type
+  template <typename S, typename = void>
+  struct HasOrbit : std::false_type {};
+  template <typename S>
+  struct HasOrbit<S, std::void_t<typename S::Orbit>> : std::true_type {};
 
  public:
   /**
@@ -80,15 +92,38 @@ class EquivariantFilter : public ManifoldEKF<M> {
    */
   EquivariantFilter(const M& xi_ref, const CovarianceM& Sigma,
                     const G& X0 = traits<G>::Identity())
-      : Base(xi_ref, Sigma), xi_ref_(xi_ref), act_on_ref_(xi_ref), g_(X0) {
-    // Compute differential of action phi at identity (Dphi0)
-    act_on_ref_(traits<G>::Identity(), &Dphi0_);
-
-    // Precompute the Innovation Lift matrix (pseudo-inverse of Dphi0)
-    InnovationLift_ = Dphi0_.completeOrthogonalDecomposition().pseudoInverse();
-    this->X_ = act_on_ref_(g_);
+      : Base(xi_ref, Sigma), xi_ref_(xi_ref), g_(X0) {
+    if constexpr (HasOrbit<Symmetry>::value) {
+      typename Symmetry::Orbit act_on_ref(xi_ref);
+      // Compute differential of action phi at identity (Dphi0)
+      act_on_ref(traits<G>::Identity(), &Dphi0_);
+      // Precompute the Innovation Lift matrix (pseudo-inverse of Dphi0)
+      InnovationLift_ =
+          Dphi0_.completeOrthogonalDecomposition().pseudoInverse();
+      this->X_ = act_on_ref(g_);
+    }
   }
 
+ protected:
+  /**
+   * @brief Protected constructor for subclasses that manage their own group
+   *        element and do not use Dphi0_/InnovationLift_.
+   *
+   * This constructor initializes ManifoldEKF with the given state and
+   * covariance, stores xi_ref_ and g_, but skips Dphi0_ computation.
+   * Subclasses should directly manipulate g_, xi_ref_, and P_.
+   *
+   * @param xi_ref Reference manifold state.
+   * @param Sigma Initial covariance.
+   * @param X0 Initial group estimate.
+   * @param subclassTag Disambiguation tag (unused).
+   */
+  struct SubclassTag {};
+  EquivariantFilter(const M& xi_ref, const CovarianceM& Sigma, const G& X0,
+                    SubclassTag)
+      : Base(xi_ref, Sigma), xi_ref_(xi_ref), g_(X0) {}
+
+ public:
   /// State on the manifold M is given by the base class
   using Base::state;
 
@@ -97,17 +132,50 @@ class EquivariantFilter : public ManifoldEKF<M> {
 
   /// Covariance in the tangent space at the current state.
   CovarianceM covariance() const {
-    MatrixM J;
-    if constexpr (MatrixM::RowsAtCompileTime == Eigen::Dynamic) {
-      J.resize(this->n_, this->n_);
+    if constexpr (HasOrbit<Symmetry>::value) {
+      MatrixM J;
+      if constexpr (MatrixM::RowsAtCompileTime == Eigen::Dynamic) {
+        J.resize(this->n_, this->n_);
+      }
+      const typename Symmetry::Diffeomorphism action_at_g(g_);
+      action_at_g(xi_ref_, &J);
+      return J.transpose() * this->P_ * J;
+    } else {
+      return this->P_;
     }
-    const typename Symmetry::Diffeomorphism action_at_g(g_);
-    action_at_g(xi_ref_, &J);
-    return J.transpose() * this->P_ * J;
   }
 
   /// @return Current group estimate.
   const G& groupEstimate() const { return g_; }
+
+  /// @return Reference state (origin).
+  const M& referenceState() const { return xi_ref_; }
+
+  /**
+   * @brief Resize internal state for dynamic-dimension manifolds.
+   *
+   * Updates P_, I_, and n_ to reflect a new tangent space dimension.
+   * Only meaningful when DimM == Eigen::Dynamic.
+   *
+   * @param newDim New tangent space dimension.
+   */
+  void resizeDynamic(int newDim) {
+    static_assert(DimM == Eigen::Dynamic,
+                  "resizeDynamic only valid for dynamic-dimension manifolds");
+    this->n_ = newDim;
+    // Resize P_ preserving existing data
+    int oldDim = this->P_.rows();
+    if (oldDim != newDim) {
+      this->P_.conservativeResize(newDim, newDim);
+      if (newDim > oldDim) {
+        this->P_.block(oldDim, 0, newDim - oldDim, oldDim).setZero();
+        this->P_.block(0, oldDim, oldDim, newDim - oldDim).setZero();
+        this->P_.block(oldDim, oldDim, newDim - oldDim, newDim - oldDim)
+            .setZero();
+      }
+    }
+    this->I_ = MatrixM::Identity(newDim, newDim);
+  }
 
   /**
    * @brief Compute the error dynamics matrix A (Automatic).
@@ -115,15 +183,8 @@ class EquivariantFilter : public ManifoldEKF<M> {
    * Calculates A = D_phi|_0 * D_lift|_u0, where u0 is the input mapped to the
    * origin.
    *
-   * Concept requirements:
-   * - `Lift` must be callable as `Lift(u_origin)(xi_ref, D_lift)` where
-   *   D_lift is an OptionalJacobian of shape DimM x DimG.
-   * - `InputOrbit` must be a group action on the input space with operator()
-   *   that accepts the current group estimate X and returns the mapped input
-   *   (no other methods are required by the filter).
-   *
-   * @tparam Lift Functor for the lift Λ(ξ, u).
-   * @tparam InputOrbit Functor for the input orbit ψ_u.
+   * @tparam Lift Functor for the lift Lambda(xi, u).
+   * @tparam InputOrbit Functor for the input orbit psi_u.
    * @param psi_u Input Orbit instance.
    * @return MatrixM The calculated error dynamics matrix A.
    */
@@ -141,11 +202,9 @@ class EquivariantFilter : public ManifoldEKF<M> {
   }
 
   /**
-   * @brief Discretize continuous-time error dynamics δ̇ = A δ over dt.
+   * @brief Discretize continuous-time error dynamics over dt.
    *
-   * On manifolds (unlike Lie groups) the error stays in a fixed tangent space
-   * at the chosen origin, so discretization is just the matrix exponential of
-   * A. K mirrors LieGroupEKF: K=1 gives Euler, K>1 calls expm(A*dt, K).
+   * K=1 gives Euler, K>1 calls expm(A*dt, K).
    */
   template <size_t K = 1>
   MatrixM transitionMatrix(const MatrixM& A, double dt) const {
@@ -158,68 +217,32 @@ class EquivariantFilter : public ManifoldEKF<M> {
 
   /**
    * @brief Propagate the filter state (Automatic).
-   *
-   * Automatically computes the error dynamics matrix A.
-   *
-   * Concept requirements:
-   * - `Lift` is used as `Lift(u_origin)(xi_ref_, D_lift)` to obtain the lift
-   *   and its Jacobian w.r.t. the manifold state.
-   * - `InputOrbit` is only used via `psi_u(X_.inverse())` to map the current
-   *   input to the origin; no other methods are needed.
-   *
-   * @tparam K Truncation order for discretization (1 = first order Euler,
-   *         >1 uses matrix exponential expm(A*dt, K)).
-   * @tparam Lift Functor for the lift Λ(ξ, u).
-   * @tparam InputOrbit Functor for the input orbit ψ_u.
-   * @param lift_u Lift functor for the current input.
-   * @param psi_u Input Orbit for the current input.
-   * @param A Error dynamics matrix (DimM x DimM).
-   * @param Qc Process noise covariance on the manifold (continuous-time).
-   * @param dt Time step.
    */
   template <size_t K = 1, typename Lift, typename InputOrbit>
   void predict(const Lift& lift_u, const InputOrbit& psi_u, const MatrixM& Qc,
                double dt) {
-    // 1. Compute A automatically
     MatrixM A = computeErrorDynamicsMatrix<Lift>(psi_u);
-
-    // 2. Delegate to explicit predict with manifold Qc
     predictWithJacobian<K>(lift_u, A, Qc, dt);
   }
 
   /**
    * @brief Propagate the filter state (Explicit).
-   *
-   * Uses provided Jacobian A and manifold covariance Qc. This allows `psi_u`
-   * to be a pure Orbit without needing to implement `inputMatrixB`.
-   *
-   * Concept requirements:
-   * - `Lift` is only used via `Lift(xi_est)` to produce a tangent vector.
-   *   No additional methods are needed for this overload.
-   *
-   * @tparam Lift Functor for the lift Λ(ξ, u).
-   * @param lift_u Lift functor for the current input.
-   * @param A Error dynamics matrix (DimM x DimM).
-   * @param Qc Process noise covariance on the manifold (continuous-time).
-   * @param dt Time step.
    */
   template <size_t K = 1, typename Lift>
   void predictWithJacobian(const Lift& lift_u, const MatrixM& A,
                            const MatrixM& Qc, double dt) {
-    // 1. Mean Propagation on Group
-    M xi_est = this->state();          // Pure action
-    TangentG Lambda = lift_u(xi_est);  // Pure lift
+    M xi_est = this->state();
+    TangentG Lambda = lift_u(xi_est);
 
     g_ = traits<G>::Compose(g_, traits<G>::Expmap(Lambda * dt));
-    M xi_next = act_on_ref_(g_);
 
-    // 2. Covariance Propagation on Manifold
-    MatrixM Phi = transitionMatrix<K>(A, dt);
-
-    // Qc is manifold continuous-time covariance: Q_M = Qc * dt
-    CovarianceM Q_manifold = Qc * dt;
-
-    Base::predict(xi_next, Phi, Q_manifold);
+    if constexpr (HasOrbit<Symmetry>::value) {
+      typename Symmetry::Orbit act_on_ref(xi_ref_);
+      M xi_next = act_on_ref(g_);
+      MatrixM Phi = transitionMatrix<K>(A, dt);
+      CovarianceM Q_manifold = Qc * dt;
+      Base::predict(xi_next, Phi, Q_manifold);
+    }
   }
 
   /**
@@ -227,12 +250,6 @@ class EquivariantFilter : public ManifoldEKF<M> {
    * pre-calculated predicted measurement and its Jacobian.
    *
    * Overwrites ManifoldEKF::update to modify g_ as well.
-   *
-   * @tparam Measurement type of the measurement space.
-   * @param prediction Predicted measurement.
-   * @param H Jacobian of the measurement function h.
-   * @param z Observed measurement.
-   * @param R Measurement noise covariance.
    */
   template <typename Measurement>
   void update(
@@ -243,25 +260,21 @@ class EquivariantFilter : public ManifoldEKF<M> {
                           traits<Measurement>::dimension>& R) {
     static constexpr int MeasDim = traits<Measurement>::dimension;
 
-    // Innovation: y = h(x_pred) - z. In tangent space: local(z, h(x_pred))
-    // NOTE: we use the `z_hat - z` sign convention, NOT `z - z_hat`.
     typename traits<Measurement>::TangentVector innovation =
         traits<Measurement>::Local(z, prediction);
 
-    // Kalman Gain: K = P H^T S^-1
-    // K will be Eigen::Matrix<double, Dim, MeasDim>
     Eigen::Matrix<double, DimM, MeasDim> K = this->KalmanGain(H, R);
-
-    // Correction in Manifold tangent space
-    // K matches dimensions with innovation, so result is TangentM
     TangentM delta_xi = -K * innovation;
 
     // Lift correction to Group tangent space
     TangentG delta_x = InnovationLift_ * delta_xi;
     g_ = traits<G>::Compose(traits<G>::Expmap(delta_x), g_);
-    this->X_ = act_on_ref_(g_);
 
-    // Update covariance on Manifold using Joseph form
+    if constexpr (HasOrbit<Symmetry>::value) {
+      typename Symmetry::Orbit act_on_ref(xi_ref_);
+      this->X_ = act_on_ref(g_);
+    }
+
     this->JosephUpdate(K, H, R);
   }
 
