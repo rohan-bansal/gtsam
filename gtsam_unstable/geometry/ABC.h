@@ -62,7 +62,7 @@ inline Vector6 toInputVector(const Vector3& w) {
 
 /// Bundle of calibration rotations modeled as a Lie group
 template <size_t N>
-using Calibrations = PowerLieGroup<Rot3, N>;
+using Calibrations = PowerLieGroup<Rot3, static_cast<int>(N)>;
 
 //========================================================================
 // State Manifold
