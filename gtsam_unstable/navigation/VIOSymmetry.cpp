@@ -1,0 +1,406 @@
+/* ----------------------------------------------------------------------------
+
+ * GTSAM Copyright 2010, Georgia Tech Research Corporation,
+ * Atlanta, Georgia 30332-0415
+ * All Rights Reserved
+ * Authors: Frank Dellaert, et al. (see THANKS for the full author list)
+
+ * See LICENSE for the license information
+
+ * -------------------------------------------------------------------------- */
+
+/**
+ * @file    VIOSymmetry.cpp
+ * @brief   VIO symmetry actions and lift helpers
+ */
+
+#include <gtsam_unstable/navigation/VIOSymmetry.h>
+
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+
+namespace gtsam {
+
+namespace {
+
+Pose3 APose(const VIOGroup& X) { return Pose3(X.A().rotation(), X.A().x(0)); }
+
+Vector3 AW(const VIOGroup& X) { return X.A().x(1); }
+
+VIOGroup::SE23 MakeA(const Rot3& R, const Point3& x0, const Vector3& w) {
+  VIOGroup::SE23::Matrix3K x;
+  x.col(0) = x0;
+  x.col(1) = w;
+  return VIOGroup::SE23(R, x);
+}
+
+Rot3 RotationFromTwoVectors(const Vector3& from, const Vector3& to) {
+  const double eps = 1e-12;
+  const Vector3 a = from.normalized();
+  const Vector3 b = to.normalized();
+  const double c = std::clamp(a.dot(b), -1.0, 1.0);
+
+  if (c > 1.0 - eps) {
+    return Rot3::Identity();
+  }
+
+  if (c < -1.0 + eps) {
+    Vector3 axis = a.unitOrthogonal();
+    axis.normalize();
+    return Rot3::Expmap(std::acos(-1.0) * axis);
+  }
+
+  Vector3 axis = a.cross(b);
+  const double s = axis.norm();
+  axis /= s;
+  const double angle = std::atan2(s, c);
+  return Rot3::Expmap(angle * axis);
+}
+
+void CheckStateAlignment(const VIOGroup& X, const VIOState& state,
+                         const char* context) {
+  if (X.n() != state.n()) {
+    throw std::invalid_argument(std::string(context) +
+                                ": landmark counts do not match");
+  }
+
+  if (!X.ids().empty()) {
+    for (size_t i = 0; i < X.n(); ++i) {
+      if (X.ids()[i] != state.cameraLandmarks[i].id) {
+        throw std::invalid_argument(std::string(context) +
+                                    ": group ids and state ids are not aligned");
+      }
+    }
+  }
+}
+
+std::vector<int> QIdsForMeasurement(const VIOGroup& X,
+                                    const VisionMeasurement& measurement) {
+  if (!X.ids().empty()) return X.ids();
+
+  if (X.n() == 0) return {};
+  if (measurement.camCoordinates.size() != X.n()) {
+    throw std::invalid_argument(
+        "outputGroupAction: cannot infer Q-to-id mapping with empty group ids");
+  }
+  return measurement.getIds();
+}
+
+Matrix NumericalDerivativeActionWrtGroup(
+    const std::function<VIOState(const VIOGroup&)>& f, const VIOGroup& X,
+    const VIOState& y0, double h = 1e-6) {
+  const int n = static_cast<int>(X.dim());
+  const int m = y0.dim();
+  Matrix H = Matrix::Zero(m, n);
+
+  for (int j = 0; j < n; ++j) {
+    Vector dx = Vector::Zero(n);
+    dx(j) = h;
+    const VIOState yPlus = f(X.retract(dx));
+    dx(j) = -h;
+    const VIOState yMinus = f(X.retract(dx));
+
+    H.col(j) =
+        (y0.localCoordinates(yPlus) - y0.localCoordinates(yMinus)) / (2.0 * h);
+  }
+
+  return H;
+}
+
+Matrix NumericalDerivativeOutputWrtGroup(
+    const std::function<VisionMeasurement(const VIOGroup&)>& f, const VIOGroup& X,
+    const VisionMeasurement& y0, double h = 1e-6) {
+  const int n = static_cast<int>(X.dim());
+  const int m = y0.dim();
+  Matrix H = Matrix::Zero(m, n);
+
+  for (int j = 0; j < n; ++j) {
+    Vector dx = Vector::Zero(n);
+    dx(j) = h;
+    const VisionMeasurement yPlus = f(X.retract(dx));
+    dx(j) = -h;
+    const VisionMeasurement yMinus = f(X.retract(dx));
+
+    H.col(j) =
+        (y0.localCoordinates(yPlus) - y0.localCoordinates(yMinus)) / (2.0 * h);
+  }
+
+  return H;
+}
+
+Matrix NumericalDerivativeOutputWrtMeasurement(
+    const std::function<VisionMeasurement(const VisionMeasurement&)>& f,
+    const VisionMeasurement& y, const VisionMeasurement& y0, double h = 1e-6) {
+  const int n = y.dim();
+  const int m = y0.dim();
+  Matrix H = Matrix::Zero(m, n);
+
+  for (int j = 0; j < n; ++j) {
+    Vector dy = Vector::Zero(n);
+    dy(j) = h;
+    const VisionMeasurement yPlus = f(y.retract(dy));
+    dy(j) = -h;
+    const VisionMeasurement yMinus = f(y.retract(dy));
+
+    H.col(j) =
+        (y0.localCoordinates(yPlus) - y0.localCoordinates(yMinus)) / (2.0 * h);
+  }
+
+  return H;
+}
+
+}  // namespace
+
+VIOSensorState sensorStateGroupAction(const VIOGroup& X,
+                                      const VIOSensorState& sensor) {
+  const Pose3 A = APose(X);
+  const Vector3 w = AW(X);
+
+  VIOSensorState out;
+  out.inputBias = sensor.inputBias + X.beta();
+  out.pose = sensor.pose.compose(A);
+  out.velocity = A.rotation().unrotate(sensor.velocity - w);
+  out.cameraOffset = A.inverse().compose(sensor.cameraOffset).compose(X.B());
+  return out;
+}
+
+VIOState stateGroupAction(const VIOGroup& X, const VIOState& state) {
+  CheckStateAlignment(X, state, "stateGroupAction");
+
+  VIOState out;
+  out.sensor = sensorStateGroupAction(X, state.sensor);
+  out.cameraLandmarks.resize(state.n());
+
+  for (size_t i = 0; i < state.n(); ++i) {
+    out.cameraLandmarks[i].p = X.Q()[i].applyInverse(state.cameraLandmarks[i].p);
+    out.cameraLandmarks[i].id = state.cameraLandmarks[i].id;
+  }
+
+  return out;
+}
+
+VisionMeasurement outputGroupAction(const VIOGroup& X,
+                                    const VisionMeasurement& measurement) {
+  VisionMeasurement out;
+  out.stamp = measurement.stamp;
+  out.camera = measurement.camera;
+  if (!measurement.camera) {
+    throw std::invalid_argument("outputGroupAction: camera model is null");
+  }
+
+  const std::vector<int> qIds = QIdsForMeasurement(X, measurement);
+  if (qIds.size() != X.n()) {
+    throw std::invalid_argument(
+        "outputGroupAction: invalid Q-to-id mapping cardinality");
+  }
+
+  for (size_t i = 0; i < X.n(); ++i) {
+    const int id = qIds[i];
+    const auto it = measurement.camCoordinates.find(id);
+    if (it == measurement.camCoordinates.end()) continue;
+
+    const Vector3 bearing = measurement.camera->undistortPoint(it->second);
+    const Vector3 rotated =
+        X.Q()[i].rotation().matrix().transpose() * bearing;
+    out.camCoordinates[id] = measurement.camera->projectPoint(rotated);
+  }
+
+  return out;
+}
+
+Vector liftVelocity(const VIOState& state, const IMUVelocity& velocity) {
+  const size_t N = state.n();
+  Vector lift = Vector::Zero(21 + 4 * static_cast<int>(N));
+
+  const VIOSensorState& sensor = state.sensor;
+  const IMUVelocity v_est = velocity - sensor.inputBias;
+
+  Vector6 U_A;
+  U_A << v_est.gyr, sensor.velocity;
+  const Vector6 U_B = sensor.cameraOffset.inverse().AdjointMap() * U_A;
+  const Vector3 u_w = -v_est.acc + sensor.gravityDir() * GRAVITY_CONSTANT;
+
+  lift.segment<6>(0) = U_A;
+  lift.segment<3>(6) = u_w;
+  lift.segment<6>(9) << velocity.gyrBiasVel, velocity.accBiasVel;
+  lift.segment<6>(15) = U_B;
+
+  const Vector6 U_C = sensor.cameraOffset.inverse().AdjointMap() * U_A;
+  const Vector3 omegaC = U_C.head<3>();
+  const Vector3 vC = U_C.tail<3>();
+
+  for (size_t i = 0; i < N; ++i) {
+    const Vector3 p = state.cameraLandmarks[i].p;
+    Vector4 W;
+    W.head<3>() = omegaC + Rot3::Hat(p) * vC / p.squaredNorm();
+    W(3) = p.dot(vC) / p.squaredNorm();
+    lift.segment<4>(21 + 4 * static_cast<int>(i)) = W;
+  }
+
+  return lift;
+}
+
+VIOGroup liftVelocityDiscrete(const VIOState& state, const IMUVelocity& velocity,
+                              double dt) {
+  const VIOSensorState& sensor = state.sensor;
+  const IMUVelocity v_est = velocity - sensor.inputBias;
+
+  const Rot3 dR = Rot3::Expmap(dt * v_est.gyr);
+  const Vector3 dXWorld =
+      dt * (sensor.pose.rotation() * sensor.velocity) +
+      0.5 * dt * dt *
+          (sensor.pose.rotation() * v_est.acc + Vector3(0, 0, -GRAVITY_CONSTANT));
+  const Point3 dXBody = sensor.pose.rotation().unrotate(dXWorld);
+  const Pose3 A_pose(dR, dXBody);
+
+  const Vector3 bodyVelocityDiff =
+      v_est.acc - sensor.gravityDir() * GRAVITY_CONSTANT;
+  const Vector3 w = sensor.velocity - (sensor.velocity + dt * bodyVelocityDiff);
+
+  const Pose3 B = sensor.cameraOffset.inverse().compose(A_pose).compose(
+      sensor.cameraOffset);
+  const Pose3 cameraPoseChangeInv = sensor.cameraOffset.inverse()
+                                        .compose(A_pose.inverse())
+                                        .compose(sensor.cameraOffset);
+
+  std::vector<SOT3> q;
+  q.resize(state.n());
+  std::vector<int> ids;
+  ids.resize(state.n());
+
+  for (size_t i = 0; i < state.n(); ++i) {
+    const Landmark& lm0 = state.cameraLandmarks[i];
+    Landmark lm1;
+    lm1.id = lm0.id;
+    lm1.p = cameraPoseChangeInv.transformFrom(lm0.p);
+
+    const Rot3 R = RotationFromTwoVectors(lm1.p, lm0.p);
+    const double a = lm0.p.norm() / lm1.p.norm();
+    q[i] = SOT3(SO3(R.matrix()), a);
+    ids[i] = lm1.id;
+  }
+
+  VIOGroup::LandmarkGroup Q(q);
+  const Vector6 beta =
+      dt * (Vector6() << velocity.gyrBiasVel, velocity.accBiasVel).finished();
+  const VIOGroup::SE23 A = MakeA(A_pose.rotation(), A_pose.translation(), w);
+  return VIOGroup(A, beta, B, Q, ids);
+}
+
+VIOState integrateSystemFunction(const VIOState& state, const IMUVelocity& velocity,
+                                 double dt) {
+  VIOState out;
+  const VIOSensorState& sensor = state.sensor;
+  const IMUVelocity v_est = velocity - sensor.inputBias;
+
+  out.sensor.inputBias.head<3>() =
+      sensor.inputBias.head<3>() + dt * velocity.gyrBiasVel;
+  out.sensor.inputBias.tail<3>() =
+      sensor.inputBias.tail<3>() + dt * velocity.accBiasVel;
+
+  const Rot3 dR = Rot3::Expmap(dt * v_est.gyr);
+  const Vector3 dXWorld =
+      dt * (sensor.pose.rotation() * sensor.velocity) +
+      0.5 * dt * dt *
+          (sensor.pose.rotation() * v_est.acc + Vector3(0, 0, -GRAVITY_CONSTANT));
+  const Point3 dXBody = sensor.pose.rotation().unrotate(dXWorld);
+  const Pose3 poseChange(dR, dXBody);
+
+  out.sensor.pose = sensor.pose.compose(poseChange);
+
+  const Vector3 inertialVelocityDiff =
+      sensor.pose.rotation() * v_est.acc + Vector3(0, 0, -GRAVITY_CONSTANT);
+  out.sensor.velocity = out.sensor.pose.rotation().unrotate(
+      sensor.pose.rotation() * sensor.velocity + dt * inertialVelocityDiff);
+
+  const Pose3 cameraPoseChangeInv = sensor.cameraOffset.inverse()
+                                        .compose(poseChange.inverse())
+                                        .compose(sensor.cameraOffset);
+  out.cameraLandmarks.resize(state.n());
+  for (size_t i = 0; i < state.n(); ++i) {
+    out.cameraLandmarks[i].p =
+        cameraPoseChangeInv.transformFrom(state.cameraLandmarks[i].p);
+    out.cameraLandmarks[i].id = state.cameraLandmarks[i].id;
+  }
+
+  out.sensor.cameraOffset = sensor.cameraOffset;
+  return out;
+}
+
+VisionMeasurement measureSystemState(
+    const VIOState& state, const std::shared_ptr<const VIOCameraModel>& camera) {
+  if (!camera) {
+    throw std::invalid_argument("measureSystemState: camera model is null");
+  }
+
+  VisionMeasurement out;
+  out.camera = camera;
+  for (const Landmark& lm : state.cameraLandmarks) {
+    out.camCoordinates[lm.id] = camera->projectPoint(lm.p);
+  }
+  return out;
+}
+
+VIOState VIOSymmetry::operator()(
+    const VIOState& xi, const VIOGroup& X,
+    OptionalJacobian<Eigen::Dynamic, Eigen::Dynamic> H_xi,
+    OptionalJacobian<Eigen::Dynamic, Eigen::Dynamic> H_X) const {
+  const VIOState y = stateGroupAction(X, xi);
+
+  if (H_xi) {
+    const int d = xi.dim();
+    H_xi->setZero(d, d);
+
+    const Pose3 A = APose(X);
+
+    Matrix66 Hpose;
+    xi.sensor.pose.compose(A, Hpose, {});
+    H_xi->block<6, 6>(6, 6) = Hpose;
+
+    Matrix66 HtmpCamera, Hcamera;
+    const Pose3 tmp = A.inverse().compose(xi.sensor.cameraOffset, {},
+                                          HtmpCamera);
+    (void)tmp.compose(X.B(), Hcamera, {});
+    H_xi->block<6, 6>(15, 15) = Hcamera * HtmpCamera;
+
+    H_xi->block<6, 6>(0, 0).setIdentity();
+    H_xi->block<3, 3>(12, 12) = A.rotation().matrix().transpose();
+
+    for (size_t i = 0; i < xi.n(); ++i) {
+      const int row = VIOSensorState::CompDim + 3 * static_cast<int>(i);
+      H_xi->block<3, 3>(row, row) =
+          (1.0 / X.Q()[i].scalar()) * X.Q()[i].rotation().matrix().transpose();
+    }
+  }
+
+  if (H_X) {
+    auto f = [&xi, this](const VIOGroup& g) { return this->operator()(xi, g); };
+    *H_X = NumericalDerivativeActionWrtGroup(f, X, y);
+  }
+
+  return y;
+}
+
+VisionMeasurement VIOOutputSymmetry::operator()(
+    const VisionMeasurement& y, const VIOGroup& X,
+    OptionalJacobian<Eigen::Dynamic, Eigen::Dynamic> H_y,
+    OptionalJacobian<Eigen::Dynamic, Eigen::Dynamic> H_X) const {
+  const VisionMeasurement out = outputGroupAction(X, y);
+
+  if (H_X) {
+    auto f = [&y, this](const VIOGroup& g) { return this->operator()(y, g); };
+    *H_X = NumericalDerivativeOutputWrtGroup(f, X, out);
+  }
+
+  if (H_y) {
+    auto f = [&X, this](const VisionMeasurement& yy) {
+      return this->operator()(yy, X);
+    };
+    *H_y = NumericalDerivativeOutputWrtMeasurement(f, y, out);
+  }
+
+  return out;
+}
+
+}  // namespace gtsam
