@@ -11,7 +11,7 @@
 
 /**
  * @file    VIOEqFMatrices.h
- * @brief   Euclidean EqF matrix suite for VIO foundations
+ * @brief   EqF coordinate suites for VIO foundations
  */
 
 #pragma once
@@ -27,7 +27,7 @@
 
 namespace gtsam {
 
-enum class CoordinateChoice { Euclidean };
+enum class CoordinateChoice { Euclidean, InvDepth };
 
 struct GTSAM_UNSTABLE_EXPORT EqFCoordinateSuite {
   /// Coordinate chart about xi0 and inverse chart.
@@ -62,9 +62,10 @@ struct GTSAM_UNSTABLE_EXPORT EqFCoordinateSuite {
 };
 
 extern const GTSAM_UNSTABLE_EXPORT EqFCoordinateSuite EqFCoordinateSuite_euclid;
+extern const GTSAM_UNSTABLE_EXPORT EqFCoordinateSuite
+    EqFCoordinateSuite_invdepth;
 
 const GTSAM_UNSTABLE_EXPORT EqFCoordinateSuite* getCoordinates(
     CoordinateChoice coordinateChoice);
 
 }  // namespace gtsam
-
