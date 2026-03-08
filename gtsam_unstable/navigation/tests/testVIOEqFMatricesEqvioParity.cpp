@@ -316,7 +316,7 @@ TEST(VIOEqFMatricesParity, InputMatrixB) {
 //******************************************************************************
 TEST(VIOEqFMatricesParity, OutputMatrixC) {
   srand(0);
-  const std::vector<int> ids = {0, 1, 2, 3, 4, 5};
+  const std::vector<int> ids = {5, 0, 1, 2, 3, 4};
   const auto camera = std::make_shared<SimplePinholeCamera>();
   const std::vector<CoordinateChoice> choices = {CoordinateChoice::Euclidean,
                                                   CoordinateChoice::InvDepth};
@@ -330,6 +330,19 @@ TEST(VIOEqFMatricesParity, OutputMatrixC) {
       const VIOGroup X = ReasonableGroupElement(ids);
       const VIOState xiHat = stateGroupAction(X, xi0);
       const VisionMeasurement yHat = measureSystemState(xiHat, camera);
+
+      for (size_t i = 0; i < xi0.n(); ++i) {
+        const int id = xi0.cameraLandmarks[i].id;
+        const auto it = std::find(X.ids().begin(), X.ids().end(), id);
+        EXPECT(it != X.ids().end());
+        if (it == X.ids().end()) continue;
+        const size_t k = static_cast<size_t>(std::distance(X.ids().begin(), it));
+        const Point2 yFromQ =
+            camera->projectPoint(X.Q()[k].applyInverse(xi0.cameraLandmarks[i].p));
+        const Point2 yStored = yHat.camCoordinates.at(id);
+        EXPECT((yFromQ - yStored).norm() < 1e-10);
+      }
+
       const Matrix Ct = suite->outputMatrixC(xi0, X, yHat);
       const Matrix Ct2 = suite->outputMatrixC(xi0, X, yHat, false);
       EXPECT_LONGS_EQUAL(2 * static_cast<long>(yHat.n()), Ct.rows());
@@ -338,6 +351,7 @@ TEST(VIOEqFMatricesParity, OutputMatrixC) {
       EXPECT_LONGS_EQUAL(xi0.dim(), Ct2.cols());
       EXPECT(Ct.array().isFinite().all());
       EXPECT(Ct2.array().isFinite().all());
+      assert_equal(Ct, Ct2, 1e-8);
 
       const auto ct = [&](const Vector& epsilon) {
         const VIOState xiE = suite->stateChartInv(epsilon, xi0);
@@ -355,6 +369,7 @@ TEST(VIOEqFMatricesParity, OutputMatrixC) {
       EXPECT_LONGS_EQUAL(Ct.rows(), CtNumerical.rows());
       EXPECT_LONGS_EQUAL(Ct.cols(), CtNumerical.cols());
       EXPECT(CtNumerical.array().isFinite().all());
+      EXPECT(IsMatrixClose(Ct, CtNumerical, floatStep));
     }
   }
 }

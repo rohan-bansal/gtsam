@@ -409,22 +409,28 @@ Matrix23 EqFoutputMatrixCiStar_euclid(
     throw std::invalid_argument("EqFoutputMatrixCiStar_euclid: null camera");
   }
 
+  using Matrix43 = Eigen::Matrix<double, 4, 3>;
+  using Matrix34 = Eigen::Matrix<double, 3, 4>;
+  using Matrix24 = Eigen::Matrix<double, 2, 4>;
+
   const Vector3 qHat = QHat.applyInverse(q0);
   const Vector3 yHat = qHat.normalized();
 
-  Eigen::Matrix<double, 4, 3> m2g;
+  Matrix43 m2g = Matrix43::Zero();
   m2g.block<3, 3>(0, 0) = -Rot3::Hat(q0);
-  m2g.block<1, 3>(3, 0) = -q0.transpose();
+  m2g.row(3) = -q0.transpose();
   m2g /= q0.squaredNorm();
 
-  auto DRho = [&camera](const Vector3& yVec) {
-    Eigen::Matrix<double, 3, 4> DRhoVec;
-    DRhoVec << Rot3::Hat(yVec), Vector3::Zero();
+  const auto DRho = [&camera](const Vector3& yVec) -> Matrix24 {
+    Matrix34 DRhoVec = Matrix34::Zero();
+    DRhoVec.block<3, 3>(0, 0) = Rot3::Hat(yVec);
     return camera->projectionJacobian(yVec) * DRhoVec;
   };
 
   const Vector3 yTru = camera->undistortPoint(y);
-  return 0.5 * (DRho(yTru) + DRho(yHat)) * QHat.inverse().AdjointMap() * m2g;
+  const Matrix24 drhoSym = 0.5 * (DRho(yTru) + DRho(yHat));
+  const Matrix44 adjQInv = QHat.inverse().AdjointMap();
+  return drhoSym * adjQInv * m2g;
 }
 
 Matrix23 EqFoutputMatrixCiStar_invdepth(
@@ -606,7 +612,6 @@ Matrix EqFCoordinateSuite::outputMatrixC(const VIOState& xi0, const VIOGroup& X,
   const int N = static_cast<int>(yIds.size());
 
   Matrix C = Matrix::Zero(2 * N, VIOSensorState::CompDim + Landmark::CompDim * M);
-  const VisionMeasurement yHat = measureSystemState(stateGroupAction(X, xi0), y.camera);
 
   for (int i = 0; i < M; ++i) {
     const int idNum = xi0.cameraLandmarks[static_cast<size_t>(i)].id;
@@ -623,15 +628,19 @@ Matrix EqFCoordinateSuite::outputMatrixC(const VIOState& xi0, const VIOGroup& X,
     }
 
     const int j = static_cast<int>(std::distance(yIds.begin(), itY));
-    C.block<2, 3>(2 * j, VIOSensorState::CompDim + 3 * i) =
-        useEquivariance ? outputMatrixCiStar(xi0.cameraLandmarks[static_cast<size_t>(i)].p,
-                                             X.Q()[k], y.camera,
-                                             y.camCoordinates.at(idNum))
-                        : outputMatrixCi(xi0.cameraLandmarks[static_cast<size_t>(i)].p,
-                                         X.Q()[k], y.camera);
+    const Point3& qi0 = xi0.cameraLandmarks[static_cast<size_t>(i)].p;
+    const SOT3& Qk = X.Q()[k];
+
+    const Matrix23 Ci = useEquivariance
+                            ? outputMatrixCiStar(qi0, Qk, y.camera,
+                                                 y.camCoordinates.at(idNum))
+                            : outputMatrixCi(qi0, Qk, y.camera);
+    C.block<2, 3>(2 * j, VIOSensorState::CompDim + 3 * i) = Ci;
   }
 
-  (void)yHat;
+  if (!C.array().isFinite().all()) {
+    throw std::runtime_error("EqFCoordinateSuite::outputMatrixC produced NaN/Inf");
+  }
   return C;
 }
 
