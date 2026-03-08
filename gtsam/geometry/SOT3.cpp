@@ -19,26 +19,38 @@
 
 #include <cmath>
 #include <iostream>
+#include <stdexcept>
 
 namespace gtsam {
+
+SOT3::SOT3(const SO3& R, double c) : Base() {
+  if (c <= 0.0) {
+    throw std::invalid_argument("SOT3: scale must be strictly positive");
+  }
+  this->first = R;
+  this->second = Vector1::Constant(std::log(c));
+}
+
+SOT3::SOT3(const MatrixNN& M) : SOT3(SO3(M.topLeftCorner<3, 3>()), M(3, 3)) {}
 
 void SOT3::print(const std::string& s) const {
   if (!s.empty()) std::cout << s << "\n";
   std::cout << "SOT3:\n";
-  R_.print("  R: ");
-  std::cout << "  c: " << c_ << "\n";
+  rotation().print("  R: ");
+  std::cout << "  c: " << scalar() << "\n";
 }
 
 bool SOT3::equals(const SOT3& other, double tol) const {
-  return R_.equals(other.R_, tol) && std::abs(c_ - other.c_) < tol;
+  return rotation().equals(other.rotation(), tol) &&
+         std::abs(scalar() - other.scalar()) < tol;
 }
 
-// MatrixLieGroup interface
+// LieGroup interface
 
 SOT3::MatrixNN SOT3::matrix() const {
   MatrixNN M = MatrixNN::Zero();
-  M.topLeftCorner<3, 3>() = R_.matrix();
-  M(3, 3) = c_;
+  M.topLeftCorner<3, 3>() = rotation().matrix();
+  M(3, 3) = scalar();
   return M;
 }
 
@@ -62,56 +74,15 @@ SOT3::TangentVector SOT3::Vee(const MatrixNN& X) {
 // Lie Group
 
 SOT3 SOT3::Expmap(const TangentVector& xi, ChartJacobian H) {
-  // SOT(3) = SO(3) x R>0 is direct product, so:
-  // exp(Omega, s) = (SO3::Expmap(Omega), exp(s))
-  const Vector3 Omega = xi.head<3>();
-  const double s = xi(3);
-  const double c = std::exp(s);
-
-  if (H) {
-    // block-diagonal Jacobian where top-left 3x3: right Jacobian of 
-    // SO3::Expmap at Omega, and bottom-right: identity, since 
-    // Local(exp(s), exp(s + ds)) = ds
-    Matrix3 H_R;
-    const SO3 R = SO3::Expmap(Omega, H ? &H_R : nullptr);
-    H->setZero();
-    H->topLeftCorner<3, 3>() = H_R;
-    (*H)(3, 3) = 1.0;
-    return SOT3(R, c);
-  }
-
-  return SOT3(SO3::Expmap(Omega), c);
+  return SOT3(Base::Expmap(xi, H));
 }
 
 SOT3::TangentVector SOT3::Logmap(const SOT3& Q, ChartJacobian H) {
-  // log(R, c) = (SO3::Logmap(R), log(c))
-  const double s = std::log(Q.c_);
-
-  if (H) {
-    // block-diagonal Jacobian where top-left 3x3: derivative of 
-    // SO3::Logmap at R, and bottom-right: identity, since 
-    // Local(exp(s), exp(s + ds)) = ds
-    Matrix3 H_R;
-    const Vector3 Omega = SO3::Logmap(Q.R_, H ? &H_R : nullptr);
-    H->setZero();
-    H->topLeftCorner<3, 3>() = H_R;
-    (*H)(3, 3) = 1.0;
-    TangentVector xi;
-    xi.head<3>() = Omega;
-    xi(3) = s;
-    return xi;
-  }
-
-  TangentVector xi;
-  xi.head<3>() = SO3::Logmap(Q.R_);
-  xi(3) = s;
-  return xi;
+  return Base::Logmap(Q, H);
 }
 
 SOT3::Jacobian SOT3::AdjointMap() const {
-  Jacobian Ad = Jacobian::Identity();
-  Ad.topLeftCorner<3, 3>() = R_.matrix();
-  return Ad;
+  return Base::AdjointMap();
 }
 
 SOT3 SOT3::ChartAtOrigin::Retract(const TangentVector& xi, ChartJacobian H) {

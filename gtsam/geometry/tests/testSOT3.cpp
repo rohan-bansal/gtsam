@@ -191,10 +191,10 @@ TEST(SOT3, AdjointMap) {
   // bottom-right = 1
   DOUBLES_EQUAL(1.0, Ad(3, 3), 1e-9);
 
-  // consistency check with generic MatrixLieGroup AdjointMap
-  const Eigen::Matrix4d Ad_generic =
-      static_cast<const MatrixLieGroup<SOT3, 4, 4>*>(&Q)->AdjointMap();
-  EXPECT(assert_equal(Ad_generic, Ad, 1e-9));
+  // consistency with direct-product structure SO(3) x R
+  Eigen::Matrix4d Ad_expected = Eigen::Matrix4d::Identity();
+  Ad_expected.topLeftCorner<3, 3>() = Q.rotation().matrix();
+  EXPECT(assert_equal(Ad_expected, Ad, 1e-9));
 }
 
 //******************************************************************************
