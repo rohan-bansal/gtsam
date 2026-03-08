@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 
 namespace gtsam {
 
@@ -36,26 +37,9 @@ VIOGroup::SE23 MakeA(const Rot3& R, const Point3& t, const Vector3& w) {
 }
 
 Rot3 RotationFromTwoVectors(const Vector3& from, const Vector3& to) {
-  const double eps = 1e-12;
-  const Vector3 a = from.normalized();
-  const Vector3 b = to.normalized();
-  const double c = std::clamp(a.dot(b), -1.0, 1.0);
-
-  if (c > 1.0 - eps) {
-    return Rot3::Identity();
-  }
-
-  if (c < -1.0 + eps) {
-    Vector3 axis = a.unitOrthogonal();
-    axis.normalize();
-    return Rot3::Expmap(std::acos(-1.0) * axis);
-  }
-
-  Vector3 axis = a.cross(b);
-  const double s = axis.norm();
-  axis /= s;
-  const double angle = std::atan2(s, c);
-  return Rot3::Expmap(angle * axis);
+  gtsam::Quaternion q;
+  q.setFromTwoVectors(from, to);
+  return Rot3(q);
 }
 
 Matrix NumericalDifferential(const std::function<Vector(const Vector&)>& f,
@@ -635,6 +619,17 @@ Matrix EqFCoordinateSuite::outputMatrixC(const VIOState& xi0, const VIOGroup& X,
                             ? outputMatrixCiStar(qi0, Qk, y.camera,
                                                  y.camCoordinates.at(idNum))
                             : outputMatrixCi(qi0, Qk, y.camera);
+    if (!Ci.array().isFinite().all()) {
+      const Point3 qHat = Qk.applyInverse(qi0);
+      const Point2 yObs = y.camCoordinates.at(idNum);
+      const Vector3 yUnd = y.camera->undistortPoint(yObs);
+      throw std::runtime_error(
+          "EqFCoordinateSuite::outputMatrixC: non-finite Ci for id " +
+          std::to_string(idNum) + ", qi0_norm=" + std::to_string(qi0.norm()) +
+          ", qHat_norm=" + std::to_string(qHat.norm()) +
+          ", Q_scale=" + std::to_string(Qk.scalar()) +
+          ", yUnd_norm=" + std::to_string(yUnd.norm()));
+    }
     C.block<2, 3>(2 * j, VIOSensorState::CompDim + 3 * i) = Ci;
   }
 

@@ -81,11 +81,7 @@ class EquivariantFilter : public ManifoldEKF<M> {
   EquivariantFilter(const M& xi_ref, const CovarianceM& Sigma,
                     const G& X0 = traits<G>::Identity())
       : Base(xi_ref, Sigma), xi_ref_(xi_ref), act_on_ref_(xi_ref), g_(X0) {
-    // Compute differential of action phi at identity (Dphi0)
-    act_on_ref_(traits<G>::Identity(), &Dphi0_);
-
-    // Precompute the Innovation Lift matrix (pseudo-inverse of Dphi0)
-    InnovationLift_ = Dphi0_.completeOrthogonalDecomposition().pseudoInverse();
+    recomputeActionDifferentials();
     this->X_ = act_on_ref_(g_);
   }
 
@@ -108,6 +104,63 @@ class EquivariantFilter : public ManifoldEKF<M> {
 
   /// @return Current group estimate.
   const G& groupEstimate() const { return g_; }
+
+ protected:
+  /// @return Current fixed reference state xi_ref.
+  const M& referenceState() const { return xi_ref_; }
+
+  /// Recompute Dphi0 and innovation lift for current xi_ref_/act_on_ref_.
+  void recomputeActionDifferentials() {
+    // Compute differential of action phi at identity (Dphi0).
+    // For dynamic groups, traits<G>::Identity() may not carry the current
+    // runtime structure (e.g., landmark count). Use identity induced from g_.
+    const G identity = traits<G>::Between(g_, g_);
+    act_on_ref_(identity, &Dphi0_);
+    // Precompute innovation lift matrix (pseudo-inverse of Dphi0).
+    InnovationLift_ = Dphi0_.completeOrthogonalDecomposition().pseudoInverse();
+  }
+
+  /// Reset reference, covariance, and group estimate in one step.
+  void resetReferenceAndGroup(const M& xi_ref, const CovarianceM& P,
+                              const G& g) {
+    xi_ref_ = xi_ref;
+    act_on_ref_ = typename Symmetry::Orbit(xi_ref_);
+    this->n_ = traits<M>::GetDimension(xi_ref_);
+
+    if constexpr (DimM == Eigen::Dynamic) {
+      if (P.rows() != this->n_ || P.cols() != this->n_) {
+        throw std::invalid_argument(
+            "EquivariantFilter::resetReferenceAndGroup: covariance "
+            "dimension mismatch with reference state.");
+      }
+      this->I_ = MatrixM::Identity(this->n_, this->n_);
+    }
+
+    this->P_ = P;
+    g_ = g;
+    recomputeActionDifferentials();
+    this->X_ = act_on_ref_(g_);
+  }
+
+  /// Set group estimate and synchronize manifold state X_ = phi(xi_ref, g).
+  void setGroupEstimateAndSyncState(const G& g) {
+    g_ = g;
+    this->X_ = act_on_ref_(g_);
+  }
+
+  /// Set error covariance directly.
+  void setErrorCovariance(const CovarianceM& P) {
+    if constexpr (DimM == Eigen::Dynamic) {
+      if (P.rows() != this->n_ || P.cols() != this->n_) {
+        throw std::invalid_argument(
+            "EquivariantFilter::setErrorCovariance: covariance dimension "
+            "mismatch.");
+      }
+    }
+    this->P_ = P;
+  }
+
+ public:
 
   /**
    * @brief Compute the error dynamics matrix A (Automatic).

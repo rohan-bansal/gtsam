@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 
 namespace gtsam {
 
@@ -36,33 +37,20 @@ VIOGroup::SE23 MakeA(const Rot3& R, const Point3& x0, const Vector3& w) {
 }
 
 Rot3 RotationFromTwoVectors(const Vector3& from, const Vector3& to) {
-  const double eps = 1e-12;
-  const Vector3 a = from.normalized();
-  const Vector3 b = to.normalized();
-  const double c = std::clamp(a.dot(b), -1.0, 1.0);
-
-  if (c > 1.0 - eps) {
-    return Rot3::Identity();
-  }
-
-  if (c < -1.0 + eps) {
-    Vector3 axis = a.unitOrthogonal();
-    axis.normalize();
-    return Rot3::Expmap(std::acos(-1.0) * axis);
-  }
-
-  Vector3 axis = a.cross(b);
-  const double s = axis.norm();
-  axis /= s;
-  const double angle = std::atan2(s, c);
-  return Rot3::Expmap(angle * axis);
+  gtsam::Quaternion q;
+  q.setFromTwoVectors(from, to);
+  return Rot3(q);
 }
 
 void CheckStateAlignment(const VIOGroup& X, const VIOState& state,
                          const char* context) {
   if (X.n() != state.n()) {
     throw std::invalid_argument(std::string(context) +
-                                ": landmark counts do not match");
+                                ": landmark counts do not match (X.n()=" +
+                                std::to_string(X.n()) + ", state.n()=" +
+                                std::to_string(state.n()) +
+                                ", X.ids().size()=" +
+                                std::to_string(X.ids().size()) + ")");
   }
 
   if (!X.ids().empty()) {
